@@ -15,7 +15,7 @@ fn fake_config() -> NodeConfig {
 pub fn test_p2p_start() {
     let rt = Runtime::new().unwrap();
     let cfg = fake_config();
-    let (mut node, node_client) = P2PNode::new(cfg, vec![]);
+    let (mut node, _node_client) = P2PNode::new(cfg, vec![]);
     let f = async move {
         node.start().await;
     };

@@ -27,3 +27,6 @@ async-std = "0.99"
 log = "0.4"
 failure = "0.1"
 hyper = { git = "https://github.com/hyperium/hyper", branch = "master", features = ["unstable-stream"] }
+base64 = "0.10"
+sha2 = "0.8"
+hex = "0.4"

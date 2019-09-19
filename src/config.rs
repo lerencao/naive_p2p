@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize};
 
 #[derive(Debug, Deserialize)]
 pub struct P2pConfig {

@@ -1,3 +1,4 @@
+use super::types::PeerInfo;
 use failure::Fail;
 use futures::channel::oneshot;
 
@@ -7,6 +8,8 @@ pub enum P2PError {
     IoError(#[fail(cause)] ::std::io::Error),
     #[fail(display = "Sending end of oneshot dropped")]
     OneshotSenderDropped,
+    #[fail(display = "already dialing outbound: {:?}", _0)]
+    AlreadyDialingOutbound(PeerInfo),
 }
 
 impl From<::std::io::Error> for P2PError {

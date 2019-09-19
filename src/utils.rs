@@ -1,11 +1,7 @@
-use serde::{Deserialize, Serialize};
-use tokio::{
-    io::AsyncRead,
-    codec::{LengthDelimitedCodec, Framed}
-};
+use serde::{Serialize};
+
 use bytes::{
-    Bytes, BytesMut, IntoBuf,
-    buf::Buf
+    Bytes, BytesMut
 };
 use futures::{
     stream::{Stream, StreamExt},
@@ -14,7 +10,6 @@ use futures::{
 };
 
 use std::{
-    error::Error as StdError,
     io::{self, Error as IoError}
 };
 use serde::de::DeserializeOwned;

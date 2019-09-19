@@ -1,18 +1,17 @@
-use hyper::server::conn::AddrStream;
+
 use hyper::{
     service::{
-        self,
         make_service_fn,
-        service_fn,
-        Service
+        service_fn
     },
-    Error, Body, Chunk, Client, Method, Request, Response, Server, StatusCode, header
+    Body, Method, Request, Response, Server, StatusCode
 };
 use futures::{
-    Stream, StreamExt, TryStreamExt
+    TryStreamExt
 };
 
 use std::net::SocketAddr;
+
 use serde::{Deserialize, Serialize};
 use crate::p2p::NodeRequestSender;
 use failure::Fail;
@@ -21,21 +20,25 @@ use failure::Fail;
 #[derive(Serialize, Deserialize)]
 struct Message {
     nonce: u32,
-    data: String,
+    bytes: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct MessageResp {
-    cur_nonce: u32,
+    cur_nonce: i32,
     cur_hash: String
 }
+
+
+type GenericError = Box<dyn std::error::Error + Send + Sync>;
+type GenericResult<T> = std::result::Result<T, GenericError>;
 
 pub async fn run_http_server(addr: SocketAddr, node_client: NodeRequestSender) -> hyper::error::Result<()> {
     let handler = MessageHandler {
         node_client
     };
 
-    let server = Server::bind(&addr).serve(make_service_fn(move |sock| {
+    let server = Server::bind(&addr).serve(make_service_fn(move |_sock| {
         let handler = handler.clone();
         async {
             let svr = service_fn(move |req| {
@@ -51,9 +54,14 @@ pub async fn run_http_server(addr: SocketAddr, node_client: NodeRequestSender) -
 /// dispatch http request
 async fn request_handler(req: Request<Body>, mut handler: MessageHandler) -> GenericResult<Response<Body>> {
     match (req.method(), req.uri().path()) {
+        // post message to p2p network
         (&Method::POST, "/") => {
             handler.handle_message(req).await
-        }
+        },
+        // get cur hash state of the p2p node
+        (&Method::GET, "/state") => {
+            handler.get_state(req).await
+        },
         _ => {
             let resp = Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -70,18 +78,40 @@ struct MessageHandler {
 }
 
 impl MessageHandler {
+    async fn get_state(&mut self, _req: Request<Body>) -> GenericResult<Response<Body>> {
+        let resp_body = match self.node_client.cur_state().await {
+            Ok(s) => s,
+            Err(e) => Err(e.compat())?
+        };
+        Self::state_respond(resp_body)
+    }
     /// handle post http req
     async fn handle_message(&mut self, req: Request<Body>) -> GenericResult<Response<Body>> {
         let body = req.into_body().try_concat().await?;
         let json_str = String::from_utf8(body.to_vec())?;
-        let mut msg: Message = serde_json::from_str(&json_str)?;
-        let resp_body = match self.node_client.send_message(msg.nonce, msg.data).await {
+        let msg: Message = serde_json::from_str(&json_str)?;
+        let raw_data = base64::decode_config(&msg.bytes, base64::URL_SAFE)?;
+
+        let resp_body = match self.node_client.send_message(msg.nonce, raw_data).await {
             Ok(d) => d,
             Err(e) => Err(e.compat())?
         };
-        let msg_resp = MessageResp {
-            cur_nonce: resp_body.0,
-            cur_hash: resp_body.1,
+
+        Self::state_respond(resp_body)
+    }
+
+    fn state_respond(state: Option<(u32, Vec<u8>)>) -> GenericResult<Response<Body>> {
+        let msg_resp = match state {
+            Some(state) => MessageResp {
+                cur_nonce: state.0 as i32,
+                cur_hash: hex::encode(state.1)
+            },
+            None => {
+                MessageResp {
+                    cur_nonce: -1,
+                    cur_hash: "".to_string()
+                }
+            }
         };
         let resp = Response::builder()
             .status(StatusCode::OK)
@@ -89,12 +119,6 @@ impl MessageHandler {
         Ok(resp)
     }
 }
-
-
-type GenericError = Box<dyn std::error::Error + Send + Sync>;
-type GenericResult<T> = std::result::Result<T, GenericError>;
-
-
 
 
 
