@@ -19,6 +19,7 @@ use tokio::{
 
 use futures::{
     self,
+    future::{BoxFuture},
     Stream,StreamExt,
     channel::mpsc,
     stream::FuturesUnordered,
@@ -30,7 +31,7 @@ use futures::channel::oneshot;
 use crate::error::P2PError;
 
 #[derive(Clone, Default)]
-pub struct P2PConfig {
+pub struct NodeConfig {
     pub port: u16,
     pub addr: String,
     pub local_peer_id: PeerId,
@@ -85,9 +86,10 @@ pub enum P2PMessage {
 
 pub enum NodeRequest {
     DialPeer((PeerId, PeerAddr), oneshot::Sender<P2PResult<()>>),
-
+    ProcessMessage((u32, String), oneshot::Sender<P2PResult<(u32, String)>>)
 }
 
+#[derive(Clone)]
 pub struct NodeRequestSender {
     tx: mpsc::Sender<NodeRequest>,
 }
@@ -99,9 +101,16 @@ impl NodeRequestSender {
         self.tx.send(req).await.unwrap();
         oneshot_rx.await?
     }
+
+    pub async fn send_message(&mut self, nonce: u32, data: String) -> P2PResult<(u32, String)> {
+        let (oneshot_tx, oneshot_rx) = oneshot::channel();
+        let req = NodeRequest::ProcessMessage((nonce, data), oneshot_tx);
+        self.tx.send(req).await.unwrap();
+        oneshot_rx.await?
+    }
 }
 pub struct P2PNode {
-    config: P2PConfig,
+    config: NodeConfig,
     bootnodes: Vec<(PeerId, PeerAddr)>,
     active_peers: HashMap<PeerId, Peer>,
     request_rx: mpsc::Receiver<NodeRequest>,
@@ -109,7 +118,7 @@ pub struct P2PNode {
 
 
 impl P2PNode {
-    pub fn new(config: P2PConfig, bootnodes: Vec<(PeerId, PeerAddr)>)-> (P2PNode, NodeRequestSender) {
+    pub fn new(config: NodeConfig, bootnodes: Vec<(PeerId, PeerAddr)>) -> (P2PNode, NodeRequestSender) {
         let (tx, rx) = mpsc::channel(1000);
         let node = P2PNode {
             config,
@@ -131,10 +140,10 @@ impl P2PNode {
         let mut pending_outgoing_conns = FuturesUnordered::default();
         let mut dialing_requests = HashMap::default();
 
-        for peer_info in self.bootnodes.iter() {
-            let fut = Self::dial(self.config.local_peer_id.clone(), (*peer_info).clone());
-            pending_outgoing_conns.push(fut);
-        }
+//        for peer_info in self.bootnodes.iter() {
+//            let fut = Self::dial(self.config.local_peer_id.clone(), (*peer_info).clone());
+//            pending_outgoing_conns.push(fut);
+//        }
         loop {
             futures::select! {
                 incoming = listener.select_next_some() => {
@@ -160,14 +169,7 @@ impl P2PNode {
                     self.handle_outgoing_peer_result(&mut dialing_requests, outgoing_peer);
                 },
                 external_req = self.request_rx.select_next_some() => {
-                    match external_req {
-                        NodeRequest::DialPeer(peer_info, resp_tx) => {
-                            let fut = Self::dial(self.config.local_peer_id.clone(), peer_info.clone());
-                            dialing_requests.insert(peer_info.clone(), resp_tx);
-                            pending_outgoing_conns.push(fut);
-                        },
-                        _ => {}
-                    }
+                    self.handle_external_req(external_req, &mut pending_outgoing_conns);
                 },
                 complete => break,
             }
@@ -175,6 +177,25 @@ impl P2PNode {
         error!("connection handler task ended");
 
         Ok(())
+    }
+
+    fn handle_external_req(
+        &mut self,
+        req: NodeRequest,
+        pending_outgoing_conns: &mut FuturesUnordered<BoxFuture<'static, (PeerInfo, IoResult<Peer>)>>
+    ) {
+        match req {
+            NodeRequest::DialPeer(peer_info, resp_tx) => {
+                let fut = Self::dial(self.config.local_peer_id.clone(), peer_info.clone());
+//                dialing_requests.insert(peer_info.clone(), resp_tx);
+                let peer_info_clone = peer_info.clone();
+                let fut = fut.map(|r| (peer_info_clone, r) );
+                pending_outgoing_conns.push(fut.boxed());
+            },
+            NodeRequest::ProcessMessage(message, resp_tx) => {
+                // TODO: impl it
+            },
+        }
     }
 
     async fn listen(addr: &SocketAddr) -> IoResult<impl Stream<Item = IoResult<TcpStream>>> {
@@ -185,7 +206,7 @@ impl P2PNode {
 
     // dial a remote peer
     async fn dial(local_peer_id: String, peer_info: (PeerId, PeerAddr)) -> std::io::Result<Peer> {
-        let (peer_id, peer_addr) = peer_info;
+        let (peer_id, peer_addr) = peer_info.clone();
         let outbound_stream = TcpStream::connect(&peer_addr).await?;
         let mut framed = Framed::new(outbound_stream, LengthDelimitedCodec::default());
 
@@ -195,7 +216,7 @@ impl P2PNode {
 
         let resp = super::utils::read_json(&mut framed).await?;
         match resp {
-            Pong(remote_peer_id) => Ok(Peer::new(peer_info.clone(), OriginType::OutBound, framed)),
+            Pong(remote_peer_id) => Ok(Peer::new(peer_info, OriginType::OutBound, framed)),
             _ => Err(IoError::new(ErrorKind::InvalidInput, "invalid pong")),
         }
     }
@@ -219,11 +240,11 @@ impl P2PNode {
     }
 
     fn handle_incoming_peer(&mut self, peer: Peer) {
-        self.active_peers.insert(peer.remote_peer_id.clone(), peer);
+        self.active_peers.insert(peer.peer_info.0.clone(), peer);
     }
 
     fn handle_outgoing_peer(&mut self, peer: Peer) {
-        self.active_peers.insert(peer.remote_peer_id.clone(), peer);
+        self.active_peers.insert(peer.peer_info.0.clone(), peer);
     }
 
 
@@ -233,25 +254,31 @@ impl P2PNode {
         result: (PeerInfo, IoResult<Peer>)
     ) {
         let peer_info = result.0;
-        match result.1 {
+        let mut resp_sender = match dial_requests.remove(&peer_info) {
+            Some(sender) => {
+                sender
+            },
+            None => {
+                error!(target: "peer", "cannot find corresponding response channel for {:?}", &peer_info);
+                return;
+            }
+        };
+
+        let resp = match result.1 {
             Ok(peer) => {
-                self.active_peers.insert(peer.remote_peer_id.clone(), peer);
-                match dial_requests.remove(&peer_info) {
-                    Some(sender) => sender.send(Ok(())),
-                    None => error!(target: "peer", "cannot find corresponding response channel for {}", &peer_info),
-                };
+                let old_peer = self.active_peers.insert(peer.peer_info.0.clone(), peer);
+                if old_peer.is_some() {
+                    warn!("drop exists peer, info: {:?}", old_peer.unwrap().peer_info);
+                }
+                Ok(())
             },
             Err(e) => {
                 warn!("Outgoing connection handshake error {}", e);
-                match dial_requests.remove(&peer_info) {
-                    Some(sender) => {
-                        let e = P2PError::from(e);
-                        sender.send(Err(e));
-                    },
-                    None => error!(target: "peer", "cannot find corresponding response channel for {}", &peer_info),
-                };
+                let e = P2PError::from(e);
+                Err(e)
             }
-        }
+        };
+        resp_sender.send(resp);
     }
 }
 
