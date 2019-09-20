@@ -139,10 +139,9 @@ where
                         //                        self.internal_msg_tx.send();
                         match msg {
                             P2PMessage::NewData(index, data) => {
-                                self.send_internal_event(InternalEvent::NewDataReceived(
-                                    index, data,
-                                ))
-                                .await;
+                                self.send_internal_event(
+                                    InternalEvent::NewDataReceived(self.peer_info.0.clone(), index, data)
+                                ).await;
                             }
                             P2PMessage::NewPeer(peer_info) => {
                                 self.send_internal_event(InternalEvent::NewPeerFound(peer_info))
@@ -174,7 +173,7 @@ where
         {
             Ok(_) => {}
             Err(_e) => {
-                error!(target: "peer", "{:?} fail to send internal event {:?}", &self.peer_info, event);
+                error!("{:?} fail to send internal event {:?}", &self.peer_info, event);
             }
         }
     }

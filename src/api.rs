@@ -45,10 +45,10 @@ pub async fn run_http_server(
 
     match server.await {
         Err(e) => {
-            error!(target: "http", "hyper server error, reason: {:?}", e);
+            error!("hyper server error, reason: {:?}", e);
         }
         Ok(_) => {
-            info!(target: "http", "hyper server stopped");
+            info!("hyper server stopped");
         }
     }
 }

@@ -18,8 +18,8 @@ pub type P2PResult<T> = std::result::Result<T, P2PError>;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum P2PMessage {
-    Ping(PeerId),
-    Pong(PeerId),
+    Ping(PeerInfo),
+    Pong(PeerInfo),
 
     // cast
     NewData(u32, Vec<u8>),

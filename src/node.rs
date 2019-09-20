@@ -29,7 +29,7 @@ use tokio::runtime::TaskExecutor;
 #[derive(Clone, Debug)]
 pub enum InternalEvent {
     NewPeerFound(PeerInfo),
-    NewDataReceived(u32, Vec<u8>),
+    NewDataReceived(PeerId, u32, Vec<u8>), // (from, index, data)
     PeerDisconnected(PeerInfo),
 }
 
@@ -63,7 +63,6 @@ impl NodeRequestSender {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
         let req = NodeRequest::ProcessMessage((nonce, data), oneshot_tx);
         self.tx.send(req).await?;
-        info!("request sent, wait resp");
         oneshot_rx.await?
     }
 
@@ -116,7 +115,7 @@ impl P2PNode {
         let mut listener = match Self::listen(&sock_addr).await {
             Ok(listener) => listener.fuse(),
             Err(e) => {
-                error!(target: "node", "fail to listen p2p port, reason: {:?}", e);
+                error!("fail to listen p2p port, reason: {:?}", e);
                 return;
             }
         };
@@ -132,7 +131,7 @@ impl P2PNode {
                 peer_addr.to_string(),
             ))) {
                 Err(e) => {
-                    error!(target: "node", "cannot send dial bootnodes requests to channel, reason: {:?}", e);
+                    error!("cannot send dial bootnodes requests to channel, reason: {:?}", e);
                 }
                 Ok(_) => {}
             }
@@ -158,7 +157,7 @@ impl P2PNode {
                 complete => break,
             }
         }
-        info!(target: "node", "p2p node task stopped");
+        info!("p2p node task stopped");
     }
 
     fn handle_inbound(
@@ -170,7 +169,8 @@ impl P2PNode {
     ) {
         match incoming {
             Ok(incoming) => {
-                let fut = Self::accept_conn(self.config.local_peer_id.clone(), incoming);
+                let local_peer_info = (self.config.local_peer_id.clone(), self.config.p2p_addr.clone());
+                let fut = Self::accept_conn(local_peer_info, incoming);
                 pending_incoming_conns.push(fut.boxed());
             }
             Err(e) => {
@@ -182,8 +182,12 @@ impl P2PNode {
     async fn handle_inbound_peer_result(&mut self, incoming_peer: IoResult<(Peer, PeerSender)>) {
         match incoming_peer {
             Ok((peer, peer_sender)) => {
+                let peer_info = (*peer_sender.peer_info()).clone();
+                info!("inbound peer {:?} connect success", &peer_info);
+                let p2p_msg = P2PMessage::NewPeer((*peer_sender.peer_info()).clone());
+                // 只广播 inbound peer
+                self.broadcast(p2p_msg, Some(peer_sender.peer_info().0.clone())).await;
                 self.add_peer((peer, peer_sender)).await;
-                // TODO: broadcast peer
             }
             Err(e) => warn!("Incoming connection handshake error {}", e),
         }
@@ -198,6 +202,7 @@ impl P2PNode {
         >,
     ) {
         match req {
+            // TODO: 如果 active peer 太多，需要做一些限制，具体策略？
             NodeRequest::DialPeer(peer_info) => {
                 // 如果有正在链接的 peer，或者 active 的 peer，那就不连接了。
                 if dialing_requests.contains(&peer_info)
@@ -205,7 +210,8 @@ impl P2PNode {
                 {
                     warn!("already dialing peer {:?}", &peer_info);
                 } else {
-                    let fut = Self::dial(self.config.local_peer_id.clone(), peer_info.clone());
+                    let local_peer_info = (self.config.local_peer_id.clone(), self.config.p2p_addr.clone());
+                    let fut = Self::dial(local_peer_info, peer_info.clone());
                     let peer_info_clone = peer_info.clone();
 
                     dialing_requests.insert(peer_info_clone);
@@ -215,13 +221,15 @@ impl P2PNode {
                 }
             }
             NodeRequest::ProcessMessage(message, resp_tx) => {
-                // TODO: check duplicate message
-                let cur_state = self.state.insert(message.0, message.1.clone());
-                let resp = Ok(cur_state);
-                send_resp(resp_tx, resp);
-                // TODO: broadcast data
-                self.broadcast(P2PMessage::NewData(message.0, message.1.clone()))
-                    .await;
+                if self.state.contains(&message.0) {
+                    let cur_state = self.state.cur_state().map(|d| (*d.0, d.1.to_vec()));
+                    send_resp(resp_tx, Ok(cur_state));
+                } else {
+                    let cur_state = self.state.insert(message.0, message.1.clone());
+                    let resp = Ok(cur_state);
+                    send_resp(resp_tx, resp);
+                    self.broadcast(P2PMessage::NewData(message.0, message.1.clone()), None).await;
+                }
             }
             NodeRequest::CurState(resp_tx) => {
                 let cur_state = match self.state.cur_state() {
@@ -242,7 +250,7 @@ impl P2PNode {
     ) {
         let peer_info = result.0;
         if !dialing_requests.remove(&peer_info) {
-            error!(target: "peer", "cannot find ongoing dial request for {:?}", &peer_info);
+            error!("cannot find ongoing dial request for {:?}", &peer_info);
         }
 
         match result.1 {
@@ -282,15 +290,22 @@ impl P2PNode {
 
     async fn handle_internal_event(&mut self, event: InternalEvent) {
         match event {
-            InternalEvent::NewDataReceived(index, data) => {
-                self.state.insert(index, data);
-                // broadcast to other peers
+            InternalEvent::NewDataReceived(from_peer, index, data) => {
+                if !self.state.contains(&index) {
+                    info!("found new data(index: {:?}) broadcasted from peer {:?}", index, &from_peer);
+                    self.state.insert(index, data.clone());
+                    // broadcast to other peers
+                    self.broadcast(P2PMessage::NewData(index, data), Some(from_peer)).await;
+                } else {
+                    info!( "receive duplicate data(index: {:?}) broadcasted from peer {:?}", index, &from_peer);
+                }
             }
             InternalEvent::NewPeerFound(peer_info) => {
+                info!("found new peer {:?}", &peer_info);
                 if self.active_peers.contains_key(&peer_info.0) {
-                    // skip known peer
+                    info!("already connect to new peer {:?}", &peer_info.0);
                 } else {
-                    match self.request_tx.try_send(NodeRequest::DialPeer(peer_info)) {
+                    match self.request_tx.try_send(NodeRequest::DialPeer(peer_info.clone())) {
                         Err(e) => {
                             error!("fail to send node request, reason: {:?}", e);
                         }
@@ -299,6 +314,7 @@ impl P2PNode {
                 }
             }
             InternalEvent::PeerDisconnected(peer_info) => {
+                info!("remove disconnected peer: {:?}", &peer_info.0);
                 let peer_handle = self.active_peers.remove(&peer_info.0);
                 match peer_handle {
                     Some(handle) => {
@@ -311,9 +327,12 @@ impl P2PNode {
     }
 
     // 广播 p2p 消息
-    async fn broadcast(&mut self, msg: P2PMessage) {
+    async fn broadcast(&mut self, msg: P2PMessage, except: Option<PeerId>) {
         let mut broadcast_futs = FuturesUnordered::default();
         for (peer_id, peer) in self.active_peers.iter_mut() {
+            if except.contains(peer_id) {
+                continue;
+            }
             let peer_id_clone = peer_id.to_string();
             broadcast_futs.push(peer.send(msg.clone()).map(|r| (peer_id_clone, r)).boxed());
         }
@@ -343,44 +362,47 @@ impl P2PNode {
 
     // dial a remote peer
     async fn dial(
-        local_peer_id: String,
-        peer_info: (PeerId, PeerAddr),
+        local_peer_info: PeerInfo,
+        peer_info: PeerInfo,
     ) -> std::io::Result<(Peer, PeerSender)> {
         let (_peer_id, peer_addr) = peer_info.clone();
         let outbound_stream = TcpStream::connect(&peer_addr).await?;
         let mut framed = Framed::new(outbound_stream, LengthDelimitedCodec::default()).fuse();
 
-        let my_peer_id = local_peer_id;
-        let ping = Ping(my_peer_id);
+        let ping = P2PMessage::Ping(local_peer_info.clone());
         let _ = super::utils::write_json(&mut framed, &ping).await?;
 
         let resp = super::utils::read_json(&mut framed).await?;
         match resp {
-            Pong(_remote_peer_id) => Ok(Peer::new(peer_info, OriginType::OutBound, framed)),
+            Pong(remote_peer_info) => {
+                if remote_peer_info == peer_info {
+                    Ok(Peer::new(peer_info, OriginType::OutBound, framed))
+                } else {
+                    Err(IoError::new(ErrorKind::InvalidData, "peer_info mismatched"))
+                }
+            },
             _ => Err(IoError::new(ErrorKind::InvalidInput, "invalid pong")),
         }
     }
 
     // do some handshake work
     async fn accept_conn(
-        local_peer_id: String,
+        local_peer_info: PeerInfo,
         stream: TcpStream,
     ) -> std::io::Result<(Peer, PeerSender)> {
-        let remote_addr = stream.peer_addr().unwrap().to_string();
         let mut framed = Framed::new(stream, LengthDelimitedCodec::default()).fuse();
 
         let req: P2PMessage = super::utils::read_json(&mut framed).await?;
-        let remote_peer_id = match req {
-            Ping(remote_peer_id) => remote_peer_id,
+        let remote_peer_info = match req {
+            P2PMessage::Ping(remote_peer_info) => remote_peer_info,
             _ => return Err(IoError::new(ErrorKind::InvalidInput, "invalid ping")),
         };
 
-        let my_peer_id = local_peer_id;
-        let pong = Pong(my_peer_id);
+        let pong = P2PMessage::Pong(local_peer_info);
         super::utils::write_json(&mut framed, &pong).await?;
 
         Ok(Peer::new(
-            (remote_peer_id, remote_addr),
+            remote_peer_info,
             OriginType::InBound,
             framed,
         ))
@@ -389,9 +411,7 @@ impl P2PNode {
 
 fn send_resp<T: Debug>(resp_tx: oneshot::Sender<T>, data: T) {
     match resp_tx.send(data) {
-        Ok(_) => {
-            info!("resp success");
-        }
+        Ok(_) => {}
         Err(t) => {
             warn!("fail to send resp {:?}, client peer ended", t);
         }
