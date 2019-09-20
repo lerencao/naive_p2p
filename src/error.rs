@@ -1,6 +1,8 @@
 use super::types::PeerInfo;
+use crate::types::GenericError;
 use failure::Fail;
 use futures::channel::oneshot;
+use futures_channel::mpsc::SendError;
 
 #[derive(Debug, Fail)]
 pub enum P2PError {
@@ -10,6 +12,8 @@ pub enum P2PError {
     OneshotSenderDropped,
     #[fail(display = "already dialing outbound: {:?}", _0)]
     AlreadyDialingOutbound(PeerInfo),
+    #[fail(display = "channel error: {:?}", _0)]
+    ChannelError(GenericError),
 }
 
 impl From<::std::io::Error> for P2PError {
@@ -21,5 +25,11 @@ impl From<::std::io::Error> for P2PError {
 impl From<oneshot::Canceled> for P2PError {
     fn from(_: oneshot::Canceled) -> Self {
         P2PError::OneshotSenderDropped
+    }
+}
+
+impl From<SendError> for P2PError {
+    fn from(err: SendError) -> Self {
+        P2PError::ChannelError(Box::new(err))
     }
 }

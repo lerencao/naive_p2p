@@ -2,7 +2,7 @@
 pub mod api;
 pub mod config;
 pub mod error;
-pub mod p2p;
+pub mod node;
 pub mod peer;
 mod state;
 #[cfg(test)]
