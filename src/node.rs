@@ -14,17 +14,19 @@ use tokio::{
 
 use futures::{self, channel::mpsc, future::BoxFuture, stream::FuturesUnordered, Stream};
 
-use crate::node::P2PMessage::{Ping, Pong};
+use crate::node::P2PMessage::Pong;
 use futures::channel::oneshot;
 
 use crate::config::NodeConfig;
-use crate::peer::{Peer, PeerSender, PeerEvent};
+use crate::peer::{Peer, PeerEvent, PeerSender};
 use crate::state::NodeState;
-use crate::types::{OriginType, P2PMessage, P2PResult, PeerAddr, PeerId, PeerInfo};
+use crate::types::{OriginType, P2PMessage, P2PResult, PeerId, PeerInfo};
+use futures_util::rand_reexport::thread_rng;
+use rand::Rng;
 use std::collections::HashSet;
 use std::fmt::Debug;
-use tokio::runtime::TaskExecutor;
 use std::time::Instant;
+use tokio::runtime::TaskExecutor;
 
 // event flow from peer tasks to p2p main task
 #[derive(Clone, Debug)]
@@ -34,6 +36,7 @@ pub enum InternalEvent {
     PeerEvent((PeerId, PeerEvent)),
 }
 const SYNC_MAX_BLOCK: u32 = 10;
+const DISCOVER_PEER_MAX_SIZE: u32 = 5;
 
 pub enum NodeRequest {
     ProcessMessage(
@@ -49,13 +52,6 @@ pub struct NodeRequestSender {
 }
 
 impl NodeRequestSender {
-    //    pub async fn dial(&mut self, peer_id: PeerId, peer_addr: PeerAddr) -> P2PResult<()> {
-    //        let (oneshot_tx, oneshot_rx) = oneshot::channel();
-    //        let req = NodeRequest::DialPeer((peer_id, peer_addr), oneshot_tx);
-    //        self.tx.send(req).await?;
-    //        oneshot_rx.await?
-    //    }
-
     pub async fn send_message(
         &mut self,
         nonce: u32,
@@ -79,9 +75,9 @@ pub struct P2PNode {
     config: NodeConfig,
     active_peers: HashMap<PeerId, PeerSender>,
     dialing_requests: HashSet<PeerInfo>,
-    pending_outgoing_conns: FuturesUnordered<BoxFuture<'static, (PeerInfo, IoResult<(Peer, PeerSender)>)>>,
+    pending_outgoing_conns:
+        FuturesUnordered<BoxFuture<'static, (PeerInfo, IoResult<(Peer, PeerSender)>)>>,
     request_rx: mpsc::Receiver<NodeRequest>,
-    request_tx: mpsc::Sender<NodeRequest>,
     state: NodeState,
     executor: Option<TaskExecutor>,
 
@@ -100,7 +96,6 @@ impl P2PNode {
             active_peers: HashMap::default(),
             dialing_requests: HashSet::default(),
             pending_outgoing_conns: FuturesUnordered::default(),
-            request_tx: tx.clone(),
             request_rx: rx,
             state: NodeState::new(),
             executor: None,
@@ -135,13 +130,19 @@ impl P2PNode {
                 peer_addr.to_string(),
             ))) {
                 Err(e) => {
-                    error!("cannot send dial bootnodes requests to channel, reason: {:?}", e);
+                    error!(
+                        "cannot send dial bootnodes requests to channel, reason: {:?}",
+                        e
+                    );
                 }
                 Ok(_) => {}
             }
         }
 
-        let mut heartbeat_timer = tokio_timer::Interval::new_interval(std::time::Duration::SECOND * 2);
+        let mut heartbeat_timer =
+            tokio_timer::Interval::new_interval(std::time::Duration::SECOND * 2);
+        let mut peer_discovery_timer =
+            tokio_timer::Interval::new_interval(std::time::Duration::SECOND * 5);
 
         loop {
             futures::select! {
@@ -161,8 +162,11 @@ impl P2PNode {
                     self.handle_internal_event(internal_event).await;
                 },
                 heartbeat_time = heartbeat_timer.select_next_some() => {
-                    self.handle_heartbeat_timer(heartbeat_time).await;
-                }
+                    self.handle_heartbeat_timer(heartbeat_time);
+                },
+                discover_peer = peer_discovery_timer.select_next_some() => {
+                    self.handle_peer_discovery_timer();
+                },
                 complete => break,
             }
         }
@@ -178,7 +182,10 @@ impl P2PNode {
     ) {
         match incoming {
             Ok(incoming) => {
-                let local_peer_info = (self.config.local_peer_id.clone(), self.config.p2p_addr.clone());
+                let local_peer_info = (
+                    self.config.local_peer_id.clone(),
+                    self.config.p2p_addr.clone(),
+                );
                 let fut = Self::accept_conn(local_peer_info, incoming);
                 pending_incoming_conns.push(fut.boxed());
             }
@@ -195,17 +202,14 @@ impl P2PNode {
                 info!("inbound peer {:?} connect success", &peer_info);
                 let p2p_msg = P2PMessage::NewPeer((*peer_sender.peer_info()).clone());
                 // 只广播 inbound peer
-                self.broadcast(p2p_msg, Some(peer_sender.peer_info().0.clone())).await;
+                self.broadcast(p2p_msg, Some(peer_sender.peer_info().0.clone()));
                 self.add_peer((peer, peer_sender)).await;
             }
             Err(e) => warn!("Incoming connection handshake error {}", e),
         }
     }
 
-    async fn handle_external_req(
-        &mut self,
-        req: NodeRequest,
-    ) {
+    async fn handle_external_req(&mut self, req: NodeRequest) {
         match req {
             NodeRequest::ProcessMessage(message, resp_tx) => {
                 if self.state.contains(&message.0) {
@@ -215,7 +219,7 @@ impl P2PNode {
                     let cur_state = self.state.insert(message.0, message.1.clone());
                     let resp = Ok(cur_state);
                     send_resp(resp_tx, resp);
-                    self.broadcast(P2PMessage::NewData(message.0, message.1.clone()), None).await;
+                    self.broadcast(P2PMessage::NewData(message.0, message.1.clone()), None);
                 }
             }
             NodeRequest::CurState(resp_tx) => {
@@ -287,7 +291,10 @@ impl P2PNode {
                 {
                     warn!("already dialing peer {:?}", &peer_info);
                 } else {
-                    let local_peer_info = (self.config.local_peer_id.clone(), self.config.p2p_addr.clone());
+                    let local_peer_info = (
+                        self.config.local_peer_id.clone(),
+                        self.config.p2p_addr.clone(),
+                    );
                     let fut = Self::dial(local_peer_info, peer_info.clone());
                     let peer_info_clone = peer_info.clone();
 
@@ -302,11 +309,16 @@ impl P2PNode {
                     let cur_state = self.state.cur_state();
                     let missing_index = match cur_state {
                         None => 0,
-                        Some((index, _)) => *index + 1
+                        Some((index, _)) => *index + 1,
                     };
                     if missing_index <= latest_index {
-                        info!("start sync block from {:?}, start_index: {:?}", &peer_id, missing_index);
-                        if !peer_handle.try_send(P2PMessage::ScanData(missing_index, SYNC_MAX_BLOCK)) {
+                        info!(
+                            "start sync block from {:?}, start_index: {:?}",
+                            &peer_id, missing_index
+                        );
+                        if !peer_handle
+                            .try_send(P2PMessage::ScanData(missing_index, SYNC_MAX_BLOCK))
+                        {
                             warn!("fail to send sync-block request to peer {:?}", &peer_id);
                         }
                     }
@@ -323,7 +335,8 @@ impl P2PNode {
                     peer_handle.set_last_see(Instant::now());
                     if let Some(latest_index) = latest_index {
                         if self.should_sync_block(latest_index) {
-                            let sync_block = InternalEvent::SyncBlock(peer_id.clone(), latest_index);
+                            let sync_block =
+                                InternalEvent::SyncBlock(peer_id.clone(), latest_index);
                             if let Err(e) = self.internal_event_tx.try_send(sync_block) {
                                 error!("fail to reqeust sync block,reason: {:?}", e);
                             }
@@ -332,24 +345,22 @@ impl P2PNode {
                 }
             }
             PeerEvent::NewPeerFound(peer_info) => {
-                info!("found new peer {:?}", &peer_info);
-                if self.active_peers.contains_key(&peer_info.0) {
-                    info!("already connect to new peer {:?}", &peer_info.0);
-                } else {
-                    if let Err(e) = self.internal_event_tx.try_send(InternalEvent::DialPeer(peer_info.clone())) {
-                        error!("fail to request dial-peer, reason: {:?}", e);
-
-                    }
-                }
+                self.handle_found_peer(peer_info);
             }
             PeerEvent::NewDataReceived(from_peer, index, data) => {
                 if !self.state.contains(&index) {
-                    info!("found new data(index: {:?}) broadcasted from peer {:?}", index, &from_peer);
+                    info!(
+                        "found new data(index: {:?}) broadcasted from peer {:?}",
+                        index, &from_peer
+                    );
                     self.state.insert(index, data.clone());
                     // broadcast to other peers
-                    self.broadcast(P2PMessage::NewData(index, data), Some(from_peer)).await;
+                    self.broadcast(P2PMessage::NewData(index, data), Some(from_peer));
                 } else {
-                    info!( "receive duplicate data(index: {:?}) broadcasted from peer {:?}", index, &from_peer);
+                    info!(
+                        "receive duplicate data(index: {:?}) broadcasted from peer {:?}",
+                        index, &from_peer
+                    );
                 }
             }
             PeerEvent::SyncBlockRequest(start_index, max_size) => {
@@ -376,6 +387,35 @@ impl P2PNode {
                     }
                 }
             }
+            PeerEvent::DiscoverPeerRequest(_start_ts, _u32) => {
+                let active_peer_ids = self
+                    .active_peers
+                    .keys()
+                    .filter(|k| *k != &peer_id)
+                    .collect::<Vec<_>>();
+                if !active_peer_ids.is_empty() {
+                    let peer_info = {
+                        let rand_index = thread_rng().gen_range(0, active_peer_ids.len());
+                        let peer_info = self
+                            .active_peers
+                            .get(active_peer_ids[rand_index])
+                            .unwrap()
+                            .peer_info();
+                        (*peer_info).clone()
+                    };
+                    if let Some(peer_handle) = self.active_peers.get_mut(&peer_id) {
+                        if peer_id != peer_info.0 {
+                            let discover_peer_result = P2PMessage::DisCoverPeerResult(peer_info);
+                            if !peer_handle.try_send(discover_peer_result) {
+                                warn!("fail to send discover-peer result to peer {:?}", &peer_id);
+                            }
+                        }
+                    }
+                }
+            }
+            PeerEvent::DiscoverPeerResult(peer_info) => {
+                self.handle_found_peer(peer_info);
+            }
             PeerEvent::PeerDisconnected => {
                 info!("remove disconnected peer: {:?}", &peer_id);
                 let peer_handle = self.active_peers.remove(&peer_id);
@@ -390,37 +430,30 @@ impl P2PNode {
     }
 
     /// --------------------------Heartbeat timer --------------------------------
-    async fn handle_heartbeat_timer(&mut self, time: Instant) {
+    fn handle_heartbeat_timer(&mut self, _time: Instant) {
         let lastest_index = self.state.lastest_block_index();
-        self.broadcast(P2PMessage::Heartbeat(lastest_index), None).await;
+        self.broadcast(P2PMessage::Heartbeat(lastest_index), None);
+    }
+    fn handle_peer_discovery_timer(&mut self) {
+        if self.active_peers.is_empty() {
+            return;
+        }
+        let active_peer_ids = self.active_peers.keys().collect::<Vec<&PeerId>>();
+        let random_index = rand::thread_rng().gen_range(0, active_peer_ids.len());
+        let random_select_peer_id = (*active_peer_ids[random_index]).clone();
+        let peer_handle = self.active_peers.get_mut(&random_select_peer_id).unwrap();
+
+        peer_handle.discover_peer(DISCOVER_PEER_MAX_SIZE);
     }
 
     // 广播 p2p 消息
-    async fn broadcast(&mut self, msg: P2PMessage, except: Option<PeerId>) {
-        let mut broadcast_futs = FuturesUnordered::default();
+    fn broadcast(&mut self, msg: P2PMessage, except: Option<PeerId>) {
         for (peer_id, peer) in self.active_peers.iter_mut() {
             if except.contains(peer_id) {
                 continue;
             }
-            let peer_id_clone = peer_id.to_string();
-            broadcast_futs.push(peer.send(msg.clone()).map(|r| (peer_id_clone, r)).boxed());
+            let _ = peer.try_send(msg.clone());
         }
-
-        broadcast_futs
-            .for_each_concurrent(None, |(peer_id, r)| {
-                async move {
-                    match r {
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!(
-                                "fail to send p2p message to peer {:?} channel, reason: {:?}",
-                                peer_id, e
-                            );
-                        }
-                    }
-                }
-            })
-            .await;
     }
 
     async fn listen(addr: &SocketAddr) -> IoResult<impl Stream<Item = IoResult<TcpStream>>> {
@@ -449,7 +482,7 @@ impl P2PNode {
                 } else {
                     Err(IoError::new(ErrorKind::InvalidData, "peer_info mismatched"))
                 }
-            },
+            }
             _ => Err(IoError::new(ErrorKind::InvalidInput, "invalid pong")),
         }
     }
@@ -470,20 +503,30 @@ impl P2PNode {
         let pong = P2PMessage::Pong(local_peer_info);
         super::utils::write_json(&mut framed, &pong).await?;
 
-        Ok(Peer::new(
-            remote_peer_info,
-            OriginType::InBound,
-            framed,
-        ))
+        Ok(Peer::new(remote_peer_info, OriginType::InBound, framed))
+    }
+
+    /// ----------- helper functions -----------------
+
+
+    fn handle_found_peer(&mut self, peer_info: PeerInfo) {
+        if !self.active_peers.contains_key(&peer_info.0) {
+            info!("found new peer {:?}", &peer_info);
+            if let Err(e) = self
+                .internal_event_tx
+                .try_send(InternalEvent::DialPeer(peer_info.clone()))
+            {
+                error!("fail to request dial-peer, reason: {:?}", e);
+            }
+        }
     }
 
 
-    /// ----------- helper functions -----------------
     fn should_sync_block(&self, newest_index: u32) -> bool {
         let cur_state = self.state.cur_state();
         let missing_index = match cur_state {
             None => 0,
-            Some((index, _)) => *index + 1
+            Some((index, _)) => *index + 1,
         };
         missing_index <= newest_index
     }

@@ -1,4 +1,5 @@
 use crate::error::P2PError;
+
 use serde::{Deserialize, Serialize};
 
 pub type PeerId = String;
@@ -30,4 +31,7 @@ pub enum P2PMessage {
     ScanDataResult(Vec<(u32, Vec<u8>)>), // (index, data)
 
     Heartbeat(Option<u32>), // notify others I'm alive and what's my lastest block index
+
+    DiscoverPeer(Option<u64>, u32), // from_ts_in_milliseconds, max_size
+    DisCoverPeerResult(PeerInfo),
 }

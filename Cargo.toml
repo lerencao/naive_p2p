@@ -32,3 +32,4 @@ hyper = { git = "https://github.com/hyperium/hyper", branch = "master", features
 base64 = "0.10"
 sha2 = "0.8"
 hex = "0.4"
+rand = "0.7"

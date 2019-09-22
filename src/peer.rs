@@ -10,17 +10,18 @@ use futures_core::FusedStream;
 use log::{debug, error, info, warn};
 use std::io::Error as IoError;
 use std::result::Result as StdResult;
+use std::time::Instant;
 use tokio::codec::{Framed, LengthDelimitedCodec};
 use tokio::net::TcpStream;
-use std::time::Instant;
-use futures_channel::mpsc::TrySendError;
 
+/// request sent to peer
 pub enum PeerRequest {
-    // cast
+    DiscoverPeer(u32),
     Disconnect,
     Message(P2PMessage),
 }
 
+/// event sent to main loop
 #[derive(Clone, Debug)]
 pub enum PeerEvent {
     NewPeerFound(PeerInfo),
@@ -29,6 +30,8 @@ pub enum PeerEvent {
     SyncBlockRequest(u32, u32),
     SyncBlockResult(Vec<(u32, Vec<u8>)>),
 
+    DiscoverPeerRequest(Option<u64>, u32),
+    DiscoverPeerResult(PeerInfo),
     PeerDisconnected,
 }
 
@@ -50,9 +53,23 @@ impl PeerSender {
         match self.msg_tx.try_send(PeerRequest::Message(msg)) {
             Ok(_) => true,
             Err(e) => {
-                error!("fail to send p2p message to peer({:?}) task, reason : {:?}", self.peer_info(), e);
+                error!(
+                    "fail to send p2p message to peer({:?}) task, reason : {:?}",
+                    self.peer_info(),
+                    e
+                );
                 false
             }
+        }
+    }
+
+    pub fn discover_peer(&mut self, max_size: u32) {
+        if let Err(e) = self.msg_tx.try_send(PeerRequest::DiscoverPeer(max_size)) {
+            error!(
+                "fail to give order to peer({:?}) task, reason : {:?}",
+                self.peer_info(),
+                e
+            );
         }
     }
 
@@ -82,6 +99,7 @@ pub struct ConnectionPeer<S> {
     internal_msg_tx: Option<mpsc::Sender<InternalEvent>>,
     conn: S,
     closed: bool,
+    peer_discovery_last_time: Option<u64>,
 }
 
 impl<S> ConnectionPeer<S>
@@ -99,7 +117,7 @@ where
             origin: origin.clone(),
             msg_tx: tx,
             is_shutting_down: false,
-            last_see: Instant::now()
+            last_see: Instant::now(),
         };
         let peer = ConnectionPeer {
             peer_info,
@@ -108,6 +126,7 @@ where
             msg_rx: rx,
             closed: false,
             internal_msg_tx: None,
+            peer_discovery_last_time: None,
         };
         (peer, peer_client)
     }
@@ -151,6 +170,17 @@ where
                     }
                 }
             }
+            PeerRequest::DiscoverPeer(max_size) => {
+                let last_discovery = self.peer_discovery_last_time;
+                let p2p_msg = P2PMessage::DiscoverPeer(last_discovery, max_size);
+                if let Err(e) = super::utils::write_json(&mut self.conn, &p2p_msg).await {
+                    error!(
+                        "cannot send p2p message to peer {:?}, reason: {:?}, close conn now",
+                        &self.peer_info, e
+                    );
+                    self.close_conn().await;
+                }
+            }
             PeerRequest::Disconnect => {
                 self.close_conn().await;
             }
@@ -168,22 +198,45 @@ where
                         //                        self.internal_msg_tx.send();
                         match msg {
                             P2PMessage::NewData(index, data) => {
-                                self.send_peer_event(
-                                    PeerEvent::NewDataReceived(self.peer_info.0.clone(), index, data)
-                                ).await;
+                                self.send_peer_event(PeerEvent::NewDataReceived(
+                                    self.peer_info.0.clone(),
+                                    index,
+                                    data,
+                                ))
+                                .await;
                             }
                             P2PMessage::NewPeer(peer_info) => {
                                 self.send_peer_event(PeerEvent::NewPeerFound(peer_info))
                                     .await;
                             }
                             P2PMessage::Heartbeat(lastest_index) => {
-                                self.send_peer_event(PeerEvent::Heartbeated(lastest_index)).await;
+                                self.send_peer_event(PeerEvent::Heartbeated(lastest_index))
+                                    .await;
                             }
                             P2PMessage::ScanData(start_index, max_length) => {
-                                self.send_peer_event(PeerEvent::SyncBlockRequest(start_index, max_length)).await;
+                                self.send_peer_event(PeerEvent::SyncBlockRequest(
+                                    start_index,
+                                    max_length,
+                                ))
+                                .await;
                             }
                             P2PMessage::ScanDataResult(blocks) => {
-                                self.send_peer_event(PeerEvent::SyncBlockResult(blocks)).await;
+                                self.send_peer_event(PeerEvent::SyncBlockResult(blocks))
+                                    .await;
+                            }
+                            P2PMessage::DiscoverPeer(start_ts, max_size) => {
+                                self.send_peer_event(PeerEvent::DiscoverPeerRequest(
+                                    start_ts, max_size,
+                                ))
+                                .await;
+                            }
+                            P2PMessage::DisCoverPeerResult(peer_info) => {
+                                let unix_ts =
+                                    std::time::UNIX_EPOCH.elapsed().ok().unwrap().as_millis()
+                                        as u64;
+                                self.peer_discovery_last_time = Some(unix_ts);
+                                self.send_peer_event(PeerEvent::DiscoverPeerResult(peer_info))
+                                    .await;
                             }
                             _ => {}
                         }
@@ -211,14 +264,18 @@ where
         {
             Ok(_) => {}
             Err(_e) => {
-                error!("{:?} fail to send internal event {:?}", &self.peer_info, event);
+                error!(
+                    "{:?} fail to send internal event {:?}",
+                    &self.peer_info, event
+                );
             }
         }
     }
 
     async fn send_peer_event(&mut self, event: PeerEvent) {
         let peer_id = self.peer_info.0.clone();
-        self.send_internal_event(InternalEvent::PeerEvent((peer_id, event))).await;
+        self.send_internal_event(InternalEvent::PeerEvent((peer_id, event)))
+            .await;
     }
 
     async fn close_conn(&mut self) {
@@ -238,8 +295,7 @@ where
         }
         self.closed = true;
         // TODO: send event to main loop
-        self.send_peer_event(PeerEvent::PeerDisconnected)
-            .await;
+        self.send_peer_event(PeerEvent::PeerDisconnected).await;
     }
 
     pub fn peer_info(&self) -> &PeerInfo {
