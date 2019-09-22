@@ -1,6 +1,6 @@
 use super::types::{OriginType, PeerInfo};
 use crate::node::InternalEvent;
-use crate::types::{P2PMessage, P2PResult};
+use crate::types::{P2PMessage, P2PResult, PeerId};
 use bytes::{Bytes, BytesMut};
 use core::ops::{Deref, DerefMut};
 use futures::channel::mpsc;
@@ -12,6 +12,8 @@ use std::io::Error as IoError;
 use std::result::Result as StdResult;
 use tokio::codec::{Framed, LengthDelimitedCodec};
 use tokio::net::TcpStream;
+use std::time::Instant;
+use futures_channel::mpsc::TrySendError;
 
 pub enum PeerRequest {
     // cast
@@ -19,17 +21,39 @@ pub enum PeerRequest {
     Message(P2PMessage),
 }
 
+#[derive(Clone, Debug)]
+pub enum PeerEvent {
+    NewPeerFound(PeerInfo),
+    NewDataReceived(PeerId, u32, Vec<u8>), // (from, index, data)
+    Heartbeated(Option<u32>),
+    SyncBlockRequest(u32, u32),
+    SyncBlockResult(Vec<(u32, Vec<u8>)>),
+
+    PeerDisconnected,
+}
+
 pub struct PeerSender {
     peer_info: PeerInfo,
     origin: OriginType,
     msg_tx: mpsc::Sender<PeerRequest>,
     is_shutting_down: bool,
+    last_see: Instant,
 }
 
 impl PeerSender {
     pub async fn send(&mut self, msg: P2PMessage) -> P2PResult<()> {
         self.msg_tx.send(PeerRequest::Message(msg)).await?;
         Ok(())
+    }
+
+    pub fn try_send(&mut self, msg: P2PMessage) -> bool {
+        match self.msg_tx.try_send(PeerRequest::Message(msg)) {
+            Ok(_) => true,
+            Err(e) => {
+                error!("fail to send p2p message to peer({:?}) task, reason : {:?}", self.peer_info(), e);
+                false
+            }
+        }
     }
 
     pub async fn disconnect(&mut self) {
@@ -44,6 +68,10 @@ impl PeerSender {
     }
     pub fn origin(&self) -> OriginType {
         self.origin
+    }
+
+    pub fn set_last_see(&mut self, instant: Instant) {
+        self.last_see = instant;
     }
 }
 
@@ -71,6 +99,7 @@ where
             origin: origin.clone(),
             msg_tx: tx,
             is_shutting_down: false,
+            last_see: Instant::now()
         };
         let peer = ConnectionPeer {
             peer_info,
@@ -139,13 +168,22 @@ where
                         //                        self.internal_msg_tx.send();
                         match msg {
                             P2PMessage::NewData(index, data) => {
-                                self.send_internal_event(
-                                    InternalEvent::NewDataReceived(self.peer_info.0.clone(), index, data)
+                                self.send_peer_event(
+                                    PeerEvent::NewDataReceived(self.peer_info.0.clone(), index, data)
                                 ).await;
                             }
                             P2PMessage::NewPeer(peer_info) => {
-                                self.send_internal_event(InternalEvent::NewPeerFound(peer_info))
+                                self.send_peer_event(PeerEvent::NewPeerFound(peer_info))
                                     .await;
+                            }
+                            P2PMessage::Heartbeat(lastest_index) => {
+                                self.send_peer_event(PeerEvent::Heartbeated(lastest_index)).await;
+                            }
+                            P2PMessage::ScanData(start_index, max_length) => {
+                                self.send_peer_event(PeerEvent::SyncBlockRequest(start_index, max_length)).await;
+                            }
+                            P2PMessage::ScanDataResult(blocks) => {
+                                self.send_peer_event(PeerEvent::SyncBlockResult(blocks)).await;
                             }
                             _ => {}
                         }
@@ -178,6 +216,11 @@ where
         }
     }
 
+    async fn send_peer_event(&mut self, event: PeerEvent) {
+        let peer_id = self.peer_info.0.clone();
+        self.send_internal_event(InternalEvent::PeerEvent((peer_id, event))).await;
+    }
+
     async fn close_conn(&mut self) {
         match self.conn.close().await {
             Ok(_) => {
@@ -195,7 +238,7 @@ where
         }
         self.closed = true;
         // TODO: send event to main loop
-        self.send_internal_event(InternalEvent::PeerDisconnected(self.peer_info.clone()))
+        self.send_peer_event(PeerEvent::PeerDisconnected)
             .await;
     }
 

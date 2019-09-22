@@ -28,4 +28,6 @@ pub enum P2PMessage {
     // call
     ScanData(u32, u32),                  // start_index, max_length
     ScanDataResult(Vec<(u32, Vec<u8>)>), // (index, data)
+
+    Heartbeat(Option<u32>), // notify others I'm alive and what's my lastest block index
 }

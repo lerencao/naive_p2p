@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
 };
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::{
     codec::Framed,
     codec::LengthDelimitedCodec,
@@ -18,23 +18,24 @@ use crate::node::P2PMessage::{Ping, Pong};
 use futures::channel::oneshot;
 
 use crate::config::NodeConfig;
-use crate::peer::{Peer, PeerSender};
+use crate::peer::{Peer, PeerSender, PeerEvent};
 use crate::state::NodeState;
 use crate::types::{OriginType, P2PMessage, P2PResult, PeerAddr, PeerId, PeerInfo};
 use std::collections::HashSet;
 use std::fmt::Debug;
 use tokio::runtime::TaskExecutor;
+use std::time::Instant;
 
 // event flow from peer tasks to p2p main task
 #[derive(Clone, Debug)]
 pub enum InternalEvent {
-    NewPeerFound(PeerInfo),
-    NewDataReceived(PeerId, u32, Vec<u8>), // (from, index, data)
-    PeerDisconnected(PeerInfo),
+    DialPeer(PeerInfo),
+    SyncBlock(PeerId, u32), // known lastest index of peer id
+    PeerEvent((PeerId, PeerEvent)),
 }
+const SYNC_MAX_BLOCK: u32 = 10;
 
 pub enum NodeRequest {
-    DialPeer(PeerInfo),
     ProcessMessage(
         (u32, Vec<u8>),
         oneshot::Sender<P2PResult<Option<(u32, Vec<u8>)>>>,
@@ -73,9 +74,12 @@ impl NodeRequestSender {
         oneshot_rx.await?
     }
 }
+/// TODO: separate the functionality of state manager and peer_manager
 pub struct P2PNode {
     config: NodeConfig,
     active_peers: HashMap<PeerId, PeerSender>,
+    dialing_requests: HashSet<PeerInfo>,
+    pending_outgoing_conns: FuturesUnordered<BoxFuture<'static, (PeerInfo, IoResult<(Peer, PeerSender)>)>>,
     request_rx: mpsc::Receiver<NodeRequest>,
     request_tx: mpsc::Sender<NodeRequest>,
     state: NodeState,
@@ -94,6 +98,8 @@ impl P2PNode {
         let node = P2PNode {
             config,
             active_peers: HashMap::default(),
+            dialing_requests: HashSet::default(),
+            pending_outgoing_conns: FuturesUnordered::default(),
             request_tx: tx.clone(),
             request_rx: rx,
             state: NodeState::new(),
@@ -121,12 +127,10 @@ impl P2PNode {
         };
 
         let mut pending_incoming_conns = FuturesUnordered::default();
-        let mut pending_outgoing_conns = FuturesUnordered::default();
-        let mut dialing_requests = HashSet::default();
 
         for peer_info in self.config.bootnodes.iter() {
             let (peer_id, peer_addr) = peer_info;
-            match self.request_tx.try_send(NodeRequest::DialPeer((
+            match self.internal_event_tx.try_send(InternalEvent::DialPeer((
                 peer_id.to_string(),
                 peer_addr.to_string(),
             ))) {
@@ -137,6 +141,8 @@ impl P2PNode {
             }
         }
 
+        let mut heartbeat_timer = tokio_timer::Interval::new_interval(std::time::Duration::SECOND * 2);
+
         loop {
             futures::select! {
                 incoming = listener.select_next_some() => {
@@ -145,15 +151,18 @@ impl P2PNode {
                 incoming_peer = pending_incoming_conns.select_next_some() => {
                     self.handle_inbound_peer_result(incoming_peer).await;
                 },
-                outgoing_peer = pending_outgoing_conns.select_next_some() => {
-                    self.handle_outgoing_peer_result(&mut dialing_requests, outgoing_peer).await;
+                outgoing_peer = self.pending_outgoing_conns.select_next_some() => {
+                    self.handle_outgoing_peer_result(outgoing_peer).await;
                 },
                 external_req = self.request_rx.select_next_some() => {
-                    self.handle_external_req(external_req, &mut dialing_requests, &mut pending_outgoing_conns).await;
+                    self.handle_external_req(external_req).await;
                 },
                 internal_event = self.internal_event_rx.select_next_some() => {
                     self.handle_internal_event(internal_event).await;
                 },
+                heartbeat_time = heartbeat_timer.select_next_some() => {
+                    self.handle_heartbeat_timer(heartbeat_time).await;
+                }
                 complete => break,
             }
         }
@@ -196,30 +205,8 @@ impl P2PNode {
     async fn handle_external_req(
         &mut self,
         req: NodeRequest,
-        dialing_requests: &mut HashSet<PeerInfo>,
-        pending_outgoing_conns: &mut FuturesUnordered<
-            BoxFuture<'static, (PeerInfo, IoResult<(Peer, PeerSender)>)>,
-        >,
     ) {
         match req {
-            // TODO: 如果 active peer 太多，需要做一些限制，具体策略？
-            NodeRequest::DialPeer(peer_info) => {
-                // 如果有正在链接的 peer，或者 active 的 peer，那就不连接了。
-                if dialing_requests.contains(&peer_info)
-                    || self.active_peers.contains_key(&peer_info.0)
-                {
-                    warn!("already dialing peer {:?}", &peer_info);
-                } else {
-                    let local_peer_info = (self.config.local_peer_id.clone(), self.config.p2p_addr.clone());
-                    let fut = Self::dial(local_peer_info, peer_info.clone());
-                    let peer_info_clone = peer_info.clone();
-
-                    dialing_requests.insert(peer_info_clone);
-
-                    let fut = fut.map(|r| (peer_info, r));
-                    pending_outgoing_conns.push(fut.boxed());
-                }
-            }
             NodeRequest::ProcessMessage(message, resp_tx) => {
                 if self.state.contains(&message.0) {
                     let cur_state = self.state.cur_state().map(|d| (*d.0, d.1.to_vec()));
@@ -245,11 +232,10 @@ impl P2PNode {
     /// 处理 outbound 链接结果
     async fn handle_outgoing_peer_result(
         &mut self,
-        dialing_requests: &mut HashSet<PeerInfo>,
         result: (PeerInfo, IoResult<(Peer, PeerSender)>),
     ) {
         let peer_info = result.0;
-        if !dialing_requests.remove(&peer_info) {
+        if !self.dialing_requests.remove(&peer_info) {
             error!("cannot find ongoing dial request for {:?}", &peer_info);
         }
 
@@ -290,7 +276,73 @@ impl P2PNode {
 
     async fn handle_internal_event(&mut self, event: InternalEvent) {
         match event {
-            InternalEvent::NewDataReceived(from_peer, index, data) => {
+            InternalEvent::PeerEvent((peer_id, peer_event)) => {
+                self.handle_peer_event(peer_id, peer_event).await;
+            }
+            InternalEvent::DialPeer(peer_info) => {
+                // TODO: 如果 active peer 太多，需要做一些限制，具体策略？
+                // 如果有正在链接的 peer，或者 active 的 peer，那就不连接了。
+                if self.dialing_requests.contains(&peer_info)
+                    || self.active_peers.contains_key(&peer_info.0)
+                {
+                    warn!("already dialing peer {:?}", &peer_info);
+                } else {
+                    let local_peer_info = (self.config.local_peer_id.clone(), self.config.p2p_addr.clone());
+                    let fut = Self::dial(local_peer_info, peer_info.clone());
+                    let peer_info_clone = peer_info.clone();
+
+                    self.dialing_requests.insert(peer_info_clone);
+
+                    let fut = fut.map(|r| (peer_info, r));
+                    self.pending_outgoing_conns.push(fut.boxed());
+                }
+            }
+            InternalEvent::SyncBlock(peer_id, latest_index) => {
+                if let Some(peer_handle) = self.active_peers.get_mut(&peer_id) {
+                    let cur_state = self.state.cur_state();
+                    let missing_index = match cur_state {
+                        None => 0,
+                        Some((index, _)) => *index + 1
+                    };
+                    if missing_index <= latest_index {
+                        info!("start sync block from {:?}, start_index: {:?}", &peer_id, missing_index);
+                        if !peer_handle.try_send(P2PMessage::ScanData(missing_index, SYNC_MAX_BLOCK)) {
+                            warn!("fail to send sync-block request to peer {:?}", &peer_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_peer_event(&mut self, peer_id: PeerId, peer_event: PeerEvent) {
+        match peer_event {
+            PeerEvent::Heartbeated(latest_index) => {
+                debug!("receive heartbeat({:?}) from {:?}", latest_index, peer_id);
+                if let Some(peer_handle) = self.active_peers.get_mut(&peer_id) {
+                    peer_handle.set_last_see(Instant::now());
+                    if let Some(latest_index) = latest_index {
+                        if self.should_sync_block(latest_index) {
+                            let sync_block = InternalEvent::SyncBlock(peer_id.clone(), latest_index);
+                            if let Err(e) = self.internal_event_tx.try_send(sync_block) {
+                                error!("fail to reqeust sync block,reason: {:?}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            PeerEvent::NewPeerFound(peer_info) => {
+                info!("found new peer {:?}", &peer_info);
+                if self.active_peers.contains_key(&peer_info.0) {
+                    info!("already connect to new peer {:?}", &peer_info.0);
+                } else {
+                    if let Err(e) = self.internal_event_tx.try_send(InternalEvent::DialPeer(peer_info.clone())) {
+                        error!("fail to request dial-peer, reason: {:?}", e);
+
+                    }
+                }
+            }
+            PeerEvent::NewDataReceived(from_peer, index, data) => {
                 if !self.state.contains(&index) {
                     info!("found new data(index: {:?}) broadcasted from peer {:?}", index, &from_peer);
                     self.state.insert(index, data.clone());
@@ -300,22 +352,33 @@ impl P2PNode {
                     info!( "receive duplicate data(index: {:?}) broadcasted from peer {:?}", index, &from_peer);
                 }
             }
-            InternalEvent::NewPeerFound(peer_info) => {
-                info!("found new peer {:?}", &peer_info);
-                if self.active_peers.contains_key(&peer_info.0) {
-                    info!("already connect to new peer {:?}", &peer_info.0);
-                } else {
-                    match self.request_tx.try_send(NodeRequest::DialPeer(peer_info.clone())) {
-                        Err(e) => {
-                            error!("fail to send node request, reason: {:?}", e);
-                        }
-                        Ok(_) => {}
+            PeerEvent::SyncBlockRequest(start_index, max_size) => {
+                if let Some(peer_handle) = self.active_peers.get_mut(&peer_id) {
+                    let blocks = self.state.scan_block(start_index, max_size);
+                    let sync_block_result = P2PMessage::ScanDataResult(blocks);
+                    if !peer_handle.try_send(sync_block_result) {
+                        warn!("fail to send sync-block result to peer {:?}", &peer_id);
                     }
                 }
             }
-            InternalEvent::PeerDisconnected(peer_info) => {
-                info!("remove disconnected peer: {:?}", &peer_info.0);
-                let peer_handle = self.active_peers.remove(&peer_info.0);
+            PeerEvent::SyncBlockResult(blocks) => {
+                let len = blocks.len();
+                let maybe_largest_index = blocks.last().map(|(i, _)| *i);
+                for (index, data) in blocks.into_iter() {
+                    self.state.insert(index, data);
+                }
+                // 如果少于 max_block，说明没有数据要同步了。
+                if len >= SYNC_MAX_BLOCK as usize {
+                    let largest_index = maybe_largest_index.unwrap();
+                    let sync_block = InternalEvent::SyncBlock(peer_id, largest_index + 1);
+                    if let Err(e) = self.internal_event_tx.try_send(sync_block) {
+                        warn!("fail to give order of sync block, reason:{:?}", e)
+                    }
+                }
+            }
+            PeerEvent::PeerDisconnected => {
+                info!("remove disconnected peer: {:?}", &peer_id);
+                let peer_handle = self.active_peers.remove(&peer_id);
                 match peer_handle {
                     Some(handle) => {
                         drop(handle);
@@ -324,6 +387,12 @@ impl P2PNode {
                 }
             }
         }
+    }
+
+    /// --------------------------Heartbeat timer --------------------------------
+    async fn handle_heartbeat_timer(&mut self, time: Instant) {
+        let lastest_index = self.state.lastest_block_index();
+        self.broadcast(P2PMessage::Heartbeat(lastest_index), None).await;
     }
 
     // 广播 p2p 消息
@@ -406,6 +475,17 @@ impl P2PNode {
             OriginType::InBound,
             framed,
         ))
+    }
+
+
+    /// ----------- helper functions -----------------
+    fn should_sync_block(&self, newest_index: u32) -> bool {
+        let cur_state = self.state.cur_state();
+        let missing_index = match cur_state {
+            None => 0,
+            Some((index, _)) => *index + 1
+        };
+        missing_index <= newest_index
     }
 }
 

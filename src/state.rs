@@ -1,5 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::iter::FromIterator;
 
 pub struct NodeState {
     data: BTreeMap<u32, Vec<u8>>,
@@ -23,6 +24,14 @@ impl NodeState {
         self.data.contains_key(index)
     }
 
+    pub fn scan_block(&self, start_index: u32, max_len: u32) -> Vec<(u32, Vec<u8>)> {
+        let iter = self
+            .data
+            .range(start_index..u32::max_value())
+            .take(max_len as usize);
+        Vec::from_iter(iter.map(|(index, v)| (*index, v.to_vec())))
+    }
+
     /// insert a data,
     /// and try advance hashing block, return lastest nonce and hash
     pub fn insert(&mut self, index: u32, data: Vec<u8>) -> Option<(u32, Vec<u8>)> {
@@ -39,6 +48,13 @@ impl NodeState {
     pub fn cur_state(&self) -> Option<(&u32, &[u8])> {
         match self.cur_state {
             Some((ref index, ref hash)) => Some((index, hash)),
+            None => None,
+        }
+    }
+
+    pub fn lastest_block_index(&self) -> Option<u32> {
+        match self.data.iter().rev().next() {
+            Some((index, _)) => Some(*index),
             None => None,
         }
     }

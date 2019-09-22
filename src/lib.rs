@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 #![feature(option_result_contains)]
-
+#![feature(duration_constants)]
 pub mod api;
 pub mod config;
 pub mod error;
