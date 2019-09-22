@@ -54,6 +54,14 @@ client 给出 hash：`ee3d211f26b3b3d3468d269b9cc57209ff3276952622bca5bd5aa2aaa5
 1. new block broadcast
 2. 节点之间通过 hearbeat 同步 lastest block index，如果发现自己落后，就主动去同步数据。
 
-#### storage
+#### block storage
 
 内存实现。节点重启，数据丢失，重新从 bootnodes 去 sync。
+
+
+### 存在的问题
+
+- [ ] 限制 节点的 inbound/outbound 连接数。
+- [ ] 更高效的 block sync 协议。
+- [ ] 更高效的 peer discovery 方法。
+- [ ] block 落盘到 rocksdb。
