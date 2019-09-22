@@ -1,0 +1,6 @@
+p2p_addr="127.0.0.1:18082"
+http_addr="127.0.0.1:8082"
+local_peer_id="bob"
+
+[bootnodes]
+alice="127.0.0.1:18081"

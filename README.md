@@ -10,6 +10,40 @@ impl:
 6. 客户端代码在 https://github.com/fanngyuan/performance-client ，客户端发的每条消息都做了Base64，URL encoding，使用sha256.Sum256计算hash
 
 
+### Give a try
+
+开多个 shell，依次执行：
+
+```shell script
+./target/debug/naive_p2p --config configs/tom.toml 
+```
+
+```shell script
+./target/debug/naive_p2p --config configs/alice.toml 
+```
+
+```shell script
+./target/debug/naive_p2p --config configs/bob.toml 
+```
+
+用 `https://github.com/fanngyuan/performance-client` 写入数据：
+
+```shell script
+./client -times 1000 -url http://localhost:8080,http://localhost:8081,http://localhost:8082
+```
+
+client 给出 hash：`ee3d211f26b3b3d3468d269b9cc57209ff3276952622bca5bd5aa2aaa5fdc27a`
+
+查看 p2p node 的hash：
+
+- tom: `http :8080/state`
+- alice: `http :8081/state`
+- bob: `http :8082/state`
+
+
+
+### How it work
+
 #### peer discovery
 
 1. new peer 广播

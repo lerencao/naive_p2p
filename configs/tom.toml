@@ -1,0 +1,5 @@
+p2p_addr="127.0.0.1:18080"
+http_addr="127.0.0.1:8080"
+local_peer_id="tom"
+
+[bootnodes]

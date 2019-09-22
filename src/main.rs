@@ -20,7 +20,7 @@ fn main() {
                 .long("peer_id")
                 .value_name("PEER_ID")
                 .help("set peer uniq id")
-                .required(true),
+                .default_value("tom"),
         )
         .arg(
             Arg::with_name("http-addr")
