@@ -106,7 +106,7 @@ impl P2PNode {
         (node, sender)
     }
 
-    pub async fn start(&mut self, executor: TaskExecutor) {
+    pub async fn start(mut self, executor: TaskExecutor) {
         self.executor = Some(executor);
 
         info!("p2p node start with config: {:?}", self.config);

@@ -1,6 +1,6 @@
 ### native p2p
 
-impl:
+#### solve
 
 1. 客户端通过HTTP协议随机给节点发包
 2. 节点对消息按ID进行排序，并计算Hash，节点hash结果应跟客户端一致，多个节点的Hash应该一致

@@ -56,7 +56,7 @@ fn main() {
     let http_addr = node_config.http_addr.parse().unwrap();
 
     let rt = Runtime::new().unwrap();
-    let (mut node, node_client) = node::P2PNode::new(node_config);
+    let (node, node_client) = node::P2PNode::new(node_config);
     let node_fut = node.start(rt.executor().clone());
 
     // TODO: use the graceful shutdown
@@ -67,7 +67,11 @@ fn main() {
     let http_api_fut = api::run_http_server(server, node_client.clone(), graceful_shutdown_rx);
     rt.spawn(http_api_fut);
 
-    rt.block_on(node_fut);
+    rt.spawn(node_fut);
+
+    loop {
+        std::thread::park();
+    }
 }
 
 pub fn load_config(args: &ArgMatches<'_>) -> NodeConfig {
