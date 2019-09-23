@@ -13,6 +13,7 @@ use std::result::Result as StdResult;
 use std::time::Instant;
 use tokio::codec::{Framed, LengthDelimitedCodec};
 use tokio::net::TcpStream;
+use std::fmt::{Formatter, Error};
 
 /// request sent to peer
 pub enum PeerRequest {
@@ -89,6 +90,12 @@ impl PeerSender {
 
     pub fn set_last_see(&mut self, instant: Instant) {
         self.last_see = instant;
+    }
+}
+
+impl std::fmt::Debug for PeerSender {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(f, "{:?} {:?}, closed: {:?}", self.origin, self.peer_info, self.is_shutting_down)
     }
 }
 
@@ -317,6 +324,12 @@ impl<S> Deref for ConnectionPeer<S> {
 impl<S> DerefMut for ConnectionPeer<S> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conn
+    }
+}
+
+impl <S> std::fmt::Debug for ConnectionPeer<S> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(f, "{:?} {:?}, closed: {:?}", self.origin, self.peer_info, self.closed)
     }
 }
 

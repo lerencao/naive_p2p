@@ -93,7 +93,7 @@ impl MessageHandler {
         let msg: Message = serde_json::from_str(&json_str)?;
         let raw_data = base64::decode_config(&msg.bytes, base64::URL_SAFE)?;
 
-        let resp_body = match self.node_client.send_message(msg.nonce, raw_data).await {
+        let resp_body = match self.node_client.submit_block(msg.nonce, raw_data).await {
             Ok(d) => d,
             Err(e) => Err(e.compat())?,
         };

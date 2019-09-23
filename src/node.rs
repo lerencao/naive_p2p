@@ -39,7 +39,7 @@ const SYNC_MAX_BLOCK: u32 = 10;
 const DISCOVER_PEER_MAX_SIZE: u32 = 5;
 
 pub enum NodeRequest {
-    ProcessMessage(
+    SubmitBlock(
         (u32, Vec<u8>),
         oneshot::Sender<P2PResult<Option<(u32, Vec<u8>)>>>,
     ),
@@ -52,13 +52,13 @@ pub struct NodeRequestSender {
 }
 
 impl NodeRequestSender {
-    pub async fn send_message(
+    pub async fn submit_block(
         &mut self,
         nonce: u32,
         data: Vec<u8>,
     ) -> P2PResult<Option<(u32, Vec<u8>)>> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
-        let req = NodeRequest::ProcessMessage((nonce, data), oneshot_tx);
+        let req = NodeRequest::SubmitBlock((nonce, data), oneshot_tx);
         self.tx.send(req).await?;
         oneshot_rx.await?
     }
@@ -85,12 +85,17 @@ pub struct P2PNode {
     internal_event_tx: mpsc::Sender<InternalEvent>,
     // rx used in this task
     internal_event_rx: mpsc::Receiver<InternalEvent>,
+
+    // when new peer created, use this channel to notify main task
+    new_peer_notify_tx: mpsc::Sender<(Peer, PeerSender)>,
+    new_peer_notify_rx: mpsc::Receiver<(Peer, PeerSender)>
 }
 
 impl P2PNode {
     pub fn new(config: NodeConfig) -> (P2PNode, NodeRequestSender) {
         let (tx, rx) = mpsc::channel(1000);
         let (internal_event_tx, internal_event_rx) = mpsc::channel(5000);
+        let (new_peer_notify_tx, new_peer_notify_rx) = mpsc::channel(100);
         let node = P2PNode {
             config,
             active_peers: HashMap::default(),
@@ -101,6 +106,9 @@ impl P2PNode {
             executor: None,
             internal_event_tx,
             internal_event_rx,
+
+            new_peer_notify_tx,
+            new_peer_notify_rx,
         };
         let sender = NodeRequestSender { tx };
         (node, sender)
@@ -120,8 +128,6 @@ impl P2PNode {
                 return;
             }
         };
-
-        let mut pending_incoming_conns = FuturesUnordered::default();
 
         for peer_info in self.config.bootnodes.iter() {
             let (peer_id, peer_addr) = peer_info;
@@ -147,10 +153,10 @@ impl P2PNode {
         loop {
             futures::select! {
                 incoming = listener.select_next_some() => {
-                    self.handle_inbound(incoming, &mut pending_incoming_conns);
+                    self.handle_inbound(incoming);
                 },
-                incoming_peer = pending_incoming_conns.select_next_some() => {
-                    self.handle_inbound_peer_result(incoming_peer).await;
+                incoming_peer = self.new_peer_notify_rx.select_next_some() => {
+                    self.handle_inbound_peer(incoming_peer).await;
                 },
                 outgoing_peer = self.pending_outgoing_conns.select_next_some() => {
                     self.handle_outgoing_peer_result(outgoing_peer).await;
@@ -174,11 +180,8 @@ impl P2PNode {
     }
 
     fn handle_inbound(
-        &self,
+        &mut self,
         incoming: IoResult<TcpStream>,
-        pending_incoming_conns: &mut FuturesUnordered<
-            BoxFuture<'static, IoResult<(Peer, PeerSender)>>,
-        >,
     ) {
         match incoming {
             Ok(incoming) => {
@@ -186,8 +189,21 @@ impl P2PNode {
                     self.config.local_peer_id.clone(),
                     self.config.p2p_addr.clone(),
                 );
-                let fut = Self::accept_conn(local_peer_info, incoming);
-                pending_incoming_conns.push(fut.boxed());
+                let mut peer_created_notify_tx = self.new_peer_notify_tx.clone();
+                let handshake = async move {
+                    let result = Self::accept_conn(local_peer_info, incoming).await;
+                    match result {
+                        Ok((peer, peer_sender)) => {
+                            if let Err(e) = peer_created_notify_tx.send((peer, peer_sender)).await {
+                                error!("fail to notify main loop, reason: {:?}", e);
+                            }
+                        },
+                        Err(e) => {
+                            warn!("Incoming connection handshake error {:?}", e);
+                        }
+                    }
+                };
+                self.executor.as_ref().unwrap().spawn(handshake);
             }
             Err(e) => {
                 warn!("Incoming connection error {}", e);
@@ -195,23 +211,20 @@ impl P2PNode {
         }
     }
 
-    async fn handle_inbound_peer_result(&mut self, incoming_peer: IoResult<(Peer, PeerSender)>) {
-        match incoming_peer {
-            Ok((peer, peer_sender)) => {
-                let peer_info = (*peer_sender.peer_info()).clone();
-                info!("inbound peer {:?} connect success", &peer_info);
-                let p2p_msg = P2PMessage::NewPeer((*peer_sender.peer_info()).clone());
-                // 只广播 inbound peer
-                self.broadcast(p2p_msg, Some(peer_sender.peer_info().0.clone()));
-                self.add_peer((peer, peer_sender)).await;
-            }
-            Err(e) => warn!("Incoming connection handshake error {}", e),
-        }
+    async fn handle_inbound_peer(&mut self, incoming_peer: (Peer, PeerSender)) {
+
+        let (peer, peer_sender) = incoming_peer;
+        let peer_info = (*peer_sender.peer_info()).clone();
+        info!("inbound peer {:?} connect success", &peer_info);
+        let p2p_msg = P2PMessage::NewPeer((*peer_sender.peer_info()).clone());
+        // 只广播 inbound peer
+        self.broadcast(p2p_msg, Some(peer_sender.peer_info().0.clone()));
+        self.add_peer((peer, peer_sender)).await;
     }
 
     async fn handle_external_req(&mut self, req: NodeRequest) {
         match req {
-            NodeRequest::ProcessMessage(message, resp_tx) => {
+            NodeRequest::SubmitBlock(message, resp_tx) => {
                 if self.state.contains(&message.0) {
                     let cur_state = self.state.cur_state().map(|d| (*d.0, d.1.to_vec()));
                     send_resp(resp_tx, Ok(cur_state));
